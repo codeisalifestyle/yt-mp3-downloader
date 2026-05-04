@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+downloads/
+*.mp3
+*.m4a
+*.webm
+*.part
+*.ytdl
+.DS_Store
