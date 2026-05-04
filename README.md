@@ -16,6 +16,8 @@ recovers from YouTube blocks by rotating proxy IPs and User-Agent fingerprints.
 - **Block-aware retry** — when YouTube returns a 403/429 or "sign in to confirm"
   page, the downloader can call your proxy's IP-rotation endpoint and retry
   with a new browser fingerprint
+- **Resume on rerun** — a per-output download archive remembers what's already
+  on disk so a partial run can be re-issued without re-downloading anything
 - Live progress UI (rich) with overall + per-track bars and a final summary table
 
 ## Requirements
@@ -76,6 +78,9 @@ python yt_mp3_downloader.py URL -o ~/Music/yt
 # Restrict a playlist to specific items
 python yt_mp3_downloader.py URL --playlist-items 1-3,7
 
+# Force a complete re-download (ignore the resume archive)
+python yt_mp3_downloader.py URL --no-archive
+
 # Through an HTTP / HTTPS proxy
 python yt_mp3_downloader.py URL --proxy http://user:pass@host:port
 
@@ -100,6 +105,32 @@ When `--proxy` (or `YTMP3_PROXY`) is set, the script automatically:
 
 Use `--aggressive` to disable the safe profile when you're on a direct
 connection or a datacenter HTTP proxy.
+
+### Resume on rerun
+
+Every successful track is recorded as a `youtube <video_id>` line in a
+hidden archive file (default: `<output>/.yt_mp3_archive.txt`, per-playlist
+for playlist URLs). When you re-run the same URL, items already in the
+archive are skipped instantly and shown as `⏭ skip` in the summary table —
+the failed ones get retried, no waste.
+
+```bash
+# First run — partial failure
+python yt_mp3_downloader.py URL          # 20 ✓ ok, 3 ✗ fail
+
+# Network recovers — re-run; only the 3 failures are retried
+python yt_mp3_downloader.py URL          # 20 ⏭ skip, 3 ✓ ok
+```
+
+You can:
+- Point `--archive PATH` at any file (e.g. a single shared archive across
+  multiple playlists).
+- Disable the archive entirely with `--no-archive` to force every item to
+  be re-downloaded.
+- Delete or edit the archive file to retry specific items.
+
+The archive uses the standard yt-dlp format, so it's interchangeable with
+yt-dlp's `--download-archive` flag if you want to reuse the same file.
 
 ### Block handling — IP rotation + fingerprint cycling
 
@@ -153,6 +184,9 @@ options:
                             SOCKS proxies are not supported (see Notes).
   --playlist-items SPEC     Restrict a playlist to specific items
                             (e.g. '1-3', '1,5,8').
+  --archive PATH            Path to the resume-on-rerun download archive
+                            (default: <output>/.yt_mp3_archive.txt).
+  --no-archive              Disable the archive (force full re-download).
   --aggressive              Disable the gentle proxy profile.
 
 block handling:

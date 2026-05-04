@@ -75,6 +75,8 @@ except ImportError:
     sys.exit(1)
 
 
+__version__ = "0.1.1"
+
 DEFAULT_OUTPUT_DIR = Path("downloads")
 MP3_BITRATE_KBPS = "320"
 
@@ -418,6 +420,7 @@ def build_ydl_options(
     aggressive: bool,
     fingerprint: dict[str, str] | None,
     logger: CapturingLogger,
+    archive_path: Path | None = None,
     progress_hooks: list | None = None,
     postprocessor_hooks: list | None = None,
 ) -> dict:
@@ -470,6 +473,9 @@ def build_ydl_options(
     if proxy:
         options["proxy"] = proxy
 
+    if archive_path is not None:
+        options["download_archive"] = str(archive_path)
+
     if progress_hooks:
         options["progress_hooks"] = progress_hooks
 
@@ -505,8 +511,42 @@ class Entry:
 class ItemResult:
     entry: Entry
     success: bool
+    skipped: bool = False
     error: str | None = None
-    attempts: int = 1
+    attempts: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Download-archive helpers (resume-on-rerun)
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_ARCHIVE_FILENAME = ".yt_mp3_archive.txt"
+
+
+def default_archive_path(output_dir: Path) -> Path:
+    """Where the archive lives by default, given a resolved output_dir."""
+    return output_dir / DEFAULT_ARCHIVE_FILENAME
+
+
+def archived_video_ids(archive_path: Path | None) -> set[str]:
+    """Return the set of video IDs already recorded in `archive_path`.
+
+    yt-dlp writes lines of the form ``<extractor> <id>``; we ignore the
+    extractor and key off the ID alone so URLs from any front-end (watch
+    page, share link, embed) collapse to the same identifier.
+    """
+    if not archive_path or not archive_path.is_file():
+        return set()
+    ids: set[str] = set()
+    try:
+        for raw in archive_path.read_text(encoding="utf-8").splitlines():
+            parts = raw.strip().split()
+            if len(parts) >= 2:
+                ids.add(parts[1])
+    except OSError:
+        pass
+    return ids
 
 
 def extract_entries(
@@ -578,6 +618,7 @@ def download_one(
     fingerprint: dict[str, str],
     item_progress: Progress,
     item_task_id: int,
+    archive_path: Path | None,
 ) -> None:
     """Download a single entry. Raises BlockDetected on YouTube-side blocks."""
 
@@ -614,6 +655,7 @@ def download_one(
         aggressive=aggressive,
         fingerprint=fingerprint,
         logger=logger,
+        archive_path=archive_path,
         progress_hooks=[progress_hook],
         postprocessor_hooks=[postprocessor_hook],
     )
@@ -642,10 +684,13 @@ def _format_header(
     treat_as_playlist: bool,
     playlist_title: str | None,
     n_items: int,
+    n_to_download: int,
+    n_archived: int,
     output_dir: Path,
     proxy: str | None,
     aggressive: bool,
     rotate_cfg: RotateConfig,
+    archive_path: Path | None,
     playlist_items: str | None,
 ) -> Panel:
     rows: list[str] = []
@@ -653,7 +698,15 @@ def _format_header(
         f"[bold]playlist[/]  {playlist_title}" if treat_as_playlist
         else "[bold]video[/]"
     )
-    rows.append(f"[bold]items[/]     {n_items}" + (f"  ([dim]filter:[/] {playlist_items})" if playlist_items else ""))
+    items_line = f"[bold]items[/]     {n_items}"
+    if playlist_items:
+        items_line += f"  ([dim]filter:[/] {playlist_items})"
+    if n_archived:
+        items_line += (
+            f"  [dim]→[/] [green]{n_archived} already archived[/]"
+            f", [cyan]{n_to_download} to download[/]"
+        )
+    rows.append(items_line)
     rows.append(f"[bold]output[/]    {output_dir}")
     if proxy:
         rows.append(
@@ -669,6 +722,10 @@ def _format_header(
         )
     elif rotate_cfg.rotate_fingerprint:
         rows.append("[bold]rotate[/]    [dim]fingerprint only (no IP rotation URL configured)[/]")
+    if archive_path:
+        rows.append(f"[bold]archive[/]   {archive_path}")
+    else:
+        rows.append("[bold]archive[/]   [dim]disabled (--no-archive)[/]")
     return Panel(
         "\n".join(rows),
         title="[bold cyan]yt-mp3-downloader[/]",
@@ -680,18 +737,22 @@ def _format_header(
 def _summary_table(results: list[ItemResult]) -> Table:
     table = Table(title=None, show_header=True, header_style="bold", border_style="dim")
     table.add_column("#", justify="right", style="dim", width=3)
-    table.add_column("status", width=8)
+    table.add_column("status", width=10)
     table.add_column("title", overflow="fold")
     table.add_column("attempts", justify="right", style="dim")
     table.add_column("error", overflow="fold", style="red")
     for i, r in enumerate(results, 1):
-        if r.success:
+        if r.skipped:
+            status = "[blue]⏭ skip[/]"
+            err_cell = ""
+        elif r.success:
             status = "[green]✓ ok[/]"
             err_cell = ""
         else:
             status = "[red]✗ fail[/]"
             err_cell = r.error or ""
-        table.add_row(str(i), status, r.entry.title, str(r.attempts), err_cell)
+        attempts_cell = "" if r.skipped else str(r.attempts)
+        table.add_row(str(i), status, r.entry.title, attempts_cell, err_cell)
     return table
 
 
@@ -701,6 +762,7 @@ def download(
     proxy: str | None,
     aggressive: bool,
     rotate_cfg: RotateConfig,
+    archive_path: Path | None,
     playlist_items: str | None = None,
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -726,15 +788,33 @@ def download(
         output_dir = output_dir / _sanitize_filename(playlist_title)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve the archive path now that we know the final output_dir. A
+    # caller-supplied --archive (absolute) wins; otherwise default to a
+    # hidden file inside the (possibly playlist-specific) output folder.
+    resolved_archive: Path | None
+    if archive_path is None:
+        resolved_archive = None
+    elif archive_path.is_absolute():
+        resolved_archive = archive_path
+    else:
+        resolved_archive = output_dir / archive_path
+
+    archived_ids = archived_video_ids(resolved_archive)
+    n_archived = sum(1 for e in entries if e.id and e.id in archived_ids)
+    n_to_download = len(entries) - n_archived
+
     console.print(
         _format_header(
             treat_as_playlist=treat_as_playlist,
             playlist_title=playlist_title,
             n_items=len(entries),
+            n_to_download=n_to_download,
+            n_archived=n_archived,
             output_dir=output_dir,
             proxy=proxy,
             aggressive=aggressive,
             rotate_cfg=rotate_cfg,
+            archive_path=resolved_archive,
             playlist_items=playlist_items,
         )
     )
@@ -771,6 +851,10 @@ def download(
             "downloading tracks", total=len(entries)
         )
         for entry in entries:
+            if entry.id and entry.id in archived_ids:
+                results.append(ItemResult(entry=entry, success=True, skipped=True))
+                overall_progress.update(overall_task, advance=1)
+                continue
             short_title = (entry.title[:60] + "…") if len(entry.title) > 60 else entry.title
             item_task = item_progress.add_task(f"[cyan]queued[/] {short_title}", total=None)
             result = _download_with_retry(
@@ -783,6 +867,7 @@ def download(
                 fp_iter=fp_iter,
                 item_progress=item_progress,
                 item_task_id=item_task,
+                archive_path=resolved_archive,
             )
             results.append(result)
             item_progress.remove_task(item_task)
@@ -791,15 +876,23 @@ def download(
     console.print()
     console.print(_summary_table(results))
 
-    n_ok = sum(1 for r in results if r.success)
-    n_fail = len(results) - n_ok
+    n_ok = sum(1 for r in results if r.success and not r.skipped)
+    n_skip = sum(1 for r in results if r.skipped)
+    n_fail = sum(1 for r in results if not r.success)
+
+    summary_parts: list[str] = []
+    if n_ok:
+        summary_parts.append(f"[green]{n_ok} downloaded[/]")
+    if n_skip:
+        summary_parts.append(f"[blue]{n_skip} skipped[/]")
     if n_fail:
-        console.print(
-            f"\n[bold]done[/] — [green]{n_ok} succeeded[/] / [red]{n_fail} failed[/]"
-        )
-        return 1
-    console.print(f"\n[bold green]done[/] — all {n_ok} item(s) downloaded")
-    return 0
+        summary_parts.append(f"[red]{n_fail} failed[/]")
+    console.print(
+        "\n[bold]done[/] — " + " / ".join(summary_parts)
+        if summary_parts else
+        "\n[bold]done[/] — no items"
+    )
+    return 1 if n_fail else 0
 
 
 def _download_with_retry(
@@ -812,6 +905,7 @@ def _download_with_retry(
     fp_iter: Iterable[dict[str, str]],
     item_progress: Progress,
     item_task_id: int,
+    archive_path: Path | None,
 ) -> ItemResult:
     max_attempts = max(1, rotate_cfg.max_attempts) if proxy and rotate_cfg.url else 1
     attempts = 0
@@ -830,6 +924,7 @@ def _download_with_retry(
                 fingerprint=fingerprint,
                 item_progress=item_progress,
                 item_task_id=item_task_id,
+                archive_path=archive_path,
             )
             return ItemResult(entry=entry, success=True, attempts=attempts)
         except BlockDetected as e:
@@ -912,6 +1007,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Restrict a playlist download to specific items, e.g. '1-3', "
              "'1,5,8', or '1-3,7'. Same syntax as yt-dlp's --playlist-items.",
     )
+    parser.add_argument(
+        "--archive",
+        default=None,
+        help=f"Path to a yt-dlp download archive used for resume-on-rerun. "
+             f"Successfully downloaded video IDs are appended; on subsequent "
+             f"runs they are skipped. Defaults to "
+             f"<output>/{DEFAULT_ARCHIVE_FILENAME} (per-playlist for "
+             f"playlist URLs, per-output-folder for single videos).",
+    )
+    parser.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="Disable the resume-on-rerun archive entirely (every item will "
+             "be re-downloaded).",
+    )
 
     rotate_group = parser.add_argument_group(
         "block handling",
@@ -975,12 +1085,23 @@ def main(argv: list[str] | None = None) -> int:
         rotate_fingerprint=not args.no_rotate_fingerprint,
     )
 
+    archive_path: Path | None
+    if args.no_archive:
+        archive_path = None
+    elif args.archive:
+        archive_path = Path(args.archive).expanduser()
+    else:
+        # Sentinel relative path; download() will resolve it against the final
+        # (possibly playlist-specific) output_dir.
+        archive_path = Path(DEFAULT_ARCHIVE_FILENAME)
+
     return download(
         url=args.url,
         output_dir=output_dir,
         proxy=proxy,
         aggressive=args.aggressive,
         rotate_cfg=rotate_cfg,
+        archive_path=archive_path,
         playlist_items=args.playlist_items,
     )
 

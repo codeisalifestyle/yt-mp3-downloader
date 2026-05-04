@@ -9,4 +9,5 @@ downloads/
 *.webm
 *.part
 *.ytdl
+.yt_mp3_archive*
 .DS_Store
