@@ -2,7 +2,7 @@
 """
 yt-mp3-downloader
 
-Download audio from a YouTube video or playlist as 320kbps MP3 (LAME).
+Download audio from a YouTube video, playlist, or channel as 320kbps MP3 (LAME).
 
 Examples:
     # Single video, default ./downloads folder
@@ -10,6 +10,11 @@ Examples:
 
     # Playlist (auto-creates a subfolder named after the playlist)
     python yt_mp3_downloader.py "https://www.youtube.com/playlist?list=LIST_ID"
+
+    # Channel / account by handle (auto-creates a subfolder named after the channel)
+    python yt_mp3_downloader.py @MrBeast
+    python yt_mp3_downloader.py MrBeast/videos
+    python yt_mp3_downloader.py "https://www.youtube.com/@MrBeast/videos"
 
     # Custom output folder
     python yt_mp3_downloader.py URL -o ~/Music/yt
@@ -42,13 +47,57 @@ from urllib.parse import parse_qs, urlparse
 
 try:
     from yt_dlp import YoutubeDL
-    from yt_dlp.utils import DownloadError
+    from yt_dlp.utils import DownloadError, parse_count, traverse_obj
 except ImportError:
     sys.stderr.write(
         "Error: yt-dlp is not installed.\n"
         "Install it with:  pip install -r requirements.txt\n"
     )
     sys.exit(1)
+
+
+# YouTube's modern channel /videos page renders entries as `lockupViewModel`
+# blobs. yt-dlp's `_extract_lockup_view_model` strips view_count from the
+# result, even though the metadataParts text ("61K views • 7 days ago") is
+# right there in the payload. We patch it once at import time so flat
+# channel extractions surface view_count, which `--order popular` needs to
+# rank candidates without falling back to a per-video metadata fetch.
+def _patch_lockup_view_count() -> None:
+    try:
+        from yt_dlp.extractor.youtube import _tab as _ytmod
+    except Exception:
+        return
+    cls = getattr(_ytmod, "YoutubeTabBaseInfoExtractor", None)
+    if cls is None or getattr(cls, "_ytmp3_lockup_patched", False):
+        return
+    original = cls._extract_lockup_view_model
+
+    def patched(self, view_model):  # type: ignore[no-redef]
+        result = original(self, view_model)
+        if not isinstance(result, dict) or result.get("view_count") is not None:
+            return result
+        try:
+            metadata_texts = traverse_obj(view_model, (
+                "metadata", "lockupMetadataViewModel", "metadata",
+                "contentMetadataViewModel", "metadataRows", ...,
+                "metadataParts", ..., "text", "content",
+            )) or []
+            for text in metadata_texts:
+                if not isinstance(text, str) or "view" not in text.lower():
+                    continue
+                count = parse_count(text)
+                if count is not None:
+                    result["view_count"] = count
+                    break
+        except Exception:
+            pass
+        return result
+
+    cls._extract_lockup_view_model = patched
+    cls._ytmp3_lockup_patched = True
+
+
+_patch_lockup_view_count()
 
 try:
     from rich.console import Console, Group
@@ -206,6 +255,14 @@ def load_dotenv(path: Path) -> None:
         pass
 
 
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+}
+
+
 def is_playlist_url(url: str) -> bool:
     """Return True if the URL points to a playlist we should expand into a folder.
 
@@ -226,6 +283,106 @@ def is_playlist_url(url: str) -> bool:
     if list_id.startswith("RD"):
         return False
     return True
+
+
+def is_channel_url(url: str) -> bool:
+    """Return True if URL points to a YouTube channel/account we should expand.
+
+    Recognized shapes:
+        /@handle[/<tab>]
+        /channel/UC<id>[/<tab>]
+        /c/<custom-name>[/<tab>]
+        /user/<legacy-name>[/<tab>]
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.netloc.lower() not in YOUTUBE_HOSTS:
+        return False
+    parts = parsed.path.strip("/").split("/")
+    if not parts or not parts[0]:
+        return False
+    if parts[0].startswith("@"):
+        return True
+    if parts[0] in {"channel", "c", "user"} and len(parts) >= 2:
+        return True
+    return False
+
+
+def is_collection_url(url: str) -> bool:
+    """Return True if the URL is either a playlist or a channel (folder-creating)."""
+    return is_playlist_url(url) or is_channel_url(url)
+
+
+_CHANNEL_TAB = "videos"
+_CHANNEL_TAB_NAMES = {
+    "videos",
+    "shorts",
+    "streams",
+    "live",
+    "playlists",
+    "community",
+    "about",
+    "featured",
+    "search",
+    "channels",
+    "store",
+    "podcasts",
+    "releases",
+}
+
+
+def _ensure_channel_videos_tab(url: str) -> str:
+    """If `url` is a bare channel root URL (no tab), append `/videos`.
+
+    Examples:
+        https://www.youtube.com/@MrBeast        → .../@MrBeast/videos
+        https://www.youtube.com/channel/UCx...  → .../channel/UCx.../videos
+        https://www.youtube.com/@MrBeast/videos → unchanged
+        https://www.youtube.com/@MrBeast/shorts → unchanged (user picked a tab)
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if parsed.netloc.lower() not in YOUTUBE_HOSTS:
+        return url
+
+    path = parsed.path.rstrip("/")
+    parts = path.strip("/").split("/")
+
+    if not parts or not parts[0]:
+        return url
+
+    is_handle_root = parts[0].startswith("@") and len(parts) == 1
+    is_legacy_root = parts[0] in {"channel", "c", "user"} and len(parts) == 2
+    if is_handle_root or is_legacy_root:
+        return parsed._replace(path=path + f"/{_CHANNEL_TAB}").geturl()
+    return url
+
+
+def normalize_input(raw: str) -> str:
+    """Convert a user-supplied input into a full YouTube URL.
+
+    - Full URLs are returned as-is, except that bare channel root URLs get
+      `/videos` appended so the run downloads the videos tab specifically.
+    - Bare handles or usernames (with or without a leading `@`, optionally
+      followed by `/videos`) are expanded to `https://www.youtube.com/@<handle>/videos`.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return s
+    if re.match(r"^https?://", s, re.IGNORECASE):
+        return _ensure_channel_videos_tab(s)
+
+    handle_part = s.lstrip("@").strip("/")
+    if not handle_part:
+        return s
+
+    segments = handle_part.split("/", 1)
+    handle = segments[0]
+    return f"https://www.youtube.com/@{handle}/{_CHANNEL_TAB}"
 
 
 def ensure_ffmpeg() -> None:
@@ -416,7 +573,7 @@ def _redact_url(url: str) -> str:
 def build_ydl_options(
     output_dir: Path,
     proxy: str | None,
-    treat_as_playlist: bool,
+    treat_as_collection: bool,
     aggressive: bool,
     fingerprint: dict[str, str] | None,
     logger: CapturingLogger,
@@ -424,10 +581,12 @@ def build_ydl_options(
     progress_hooks: list | None = None,
     postprocessor_hooks: list | None = None,
 ) -> dict:
-    if treat_as_playlist:
-        out_template = str(output_dir / "%(title)s.%(ext)s")
-    else:
-        out_template = str(output_dir / "%(title)s.%(ext)s")
+    # treat_as_collection is kept in the signature for symmetry with the
+    # rest of the call chain (and future per-collection tweaks); the output
+    # template is the same shape for both single videos and collections —
+    # the per-collection subfolder is enforced one level up in download().
+    _ = treat_as_collection
+    out_template = str(output_dir / "%(title)s.%(ext)s")
 
     proxy_in_use = bool(proxy)
     use_safe_profile = proxy_in_use and not aggressive
@@ -505,6 +664,7 @@ class Entry:
     id: str
     title: str
     url: str
+    view_count: int | None = None
 
 
 @dataclass
@@ -566,7 +726,7 @@ def extract_entries(
         "extract_flat": "in_playlist",
         "ignoreerrors": True,
         "logger": logger,
-        "noplaylist": not is_playlist_url(url),
+        "noplaylist": not is_collection_url(url),
     }
     if proxy:
         opts["proxy"] = proxy
@@ -580,7 +740,18 @@ def extract_entries(
         raise RuntimeError("yt-dlp returned no info for the URL")
 
     if info.get("_type") == "playlist" and info.get("entries"):
-        title = info.get("title") or info.get("id")
+        # For channel URLs, yt-dlp's playlist title looks like
+        # "<Channel Name> - Videos"; prefer the cleaner channel/uploader
+        # field for the folder name when we're looking at a channel.
+        if is_channel_url(url):
+            title = (
+                info.get("channel")
+                or info.get("uploader")
+                or info.get("title")
+                or info.get("id")
+            )
+        else:
+            title = info.get("title") or info.get("id")
         entries: list[Entry] = []
         for e in info["entries"]:
             if not e:
@@ -591,11 +762,13 @@ def extract_entries(
             )
             if not video_url:
                 continue
+            view_count = e.get("view_count")
             entries.append(
                 Entry(
                     id=video_id,
                     title=e.get("title") or video_id,
                     url=video_url,
+                    view_count=int(view_count) if isinstance(view_count, (int, float)) else None,
                 )
             )
         return title, entries
@@ -605,6 +778,11 @@ def extract_entries(
             id=info.get("id", ""),
             title=info.get("title") or info.get("id", ""),
             url=info.get("webpage_url") or url,
+            view_count=(
+                int(info.get("view_count"))
+                if isinstance(info.get("view_count"), (int, float))
+                else None
+            ),
         )
     ]
 
@@ -613,7 +791,7 @@ def download_one(
     entry: Entry,
     output_dir: Path,
     proxy: str | None,
-    treat_as_playlist: bool,
+    treat_as_collection: bool,
     aggressive: bool,
     fingerprint: dict[str, str],
     item_progress: Progress,
@@ -651,7 +829,7 @@ def download_one(
     opts = build_ydl_options(
         output_dir=output_dir,
         proxy=proxy,
-        treat_as_playlist=treat_as_playlist,
+        treat_as_collection=treat_as_collection,
         aggressive=aggressive,
         fingerprint=fingerprint,
         logger=logger,
@@ -681,8 +859,8 @@ def download_one(
 
 
 def _format_header(
-    treat_as_playlist: bool,
-    playlist_title: str | None,
+    kind: str,
+    collection_title: str | None,
     n_items: int,
     n_to_download: int,
     n_archived: int,
@@ -692,15 +870,26 @@ def _format_header(
     rotate_cfg: RotateConfig,
     archive_path: Path | None,
     playlist_items: str | None,
+    limit: int | None = None,
+    order: str = "latest",
 ) -> Panel:
     rows: list[str] = []
-    rows.append(
-        f"[bold]playlist[/]  {playlist_title}" if treat_as_playlist
-        else "[bold]video[/]"
-    )
+    if kind == "channel":
+        rows.append(f"[bold]channel[/]   {collection_title}")
+    elif kind == "playlist":
+        rows.append(f"[bold]playlist[/]  {collection_title}")
+    else:
+        rows.append("[bold]video[/]")
     items_line = f"[bold]items[/]     {n_items}"
+    selector_bits: list[str] = []
+    if kind != "video" and order and order != "latest":
+        selector_bits.append(f"order: {order}")
+    if limit is not None:
+        selector_bits.append(f"limit: {limit}")
     if playlist_items:
-        items_line += f"  ([dim]filter:[/] {playlist_items})"
+        selector_bits.append(f"filter: {playlist_items}")
+    if selector_bits:
+        items_line += "  ([dim]" + ", ".join(selector_bits) + "[/])"
     if n_archived:
         items_line += (
             f"  [dim]→[/] [green]{n_archived} already archived[/]"
@@ -764,6 +953,8 @@ def download(
     rotate_cfg: RotateConfig,
     archive_path: Path | None,
     playlist_items: str | None = None,
+    limit: int | None = None,
+    order: str = "latest",
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -771,10 +962,29 @@ def download(
         reject_unsupported_proxy(proxy)
         preflight_falconproxy(proxy)
 
-    treat_as_playlist = is_playlist_url(url)
+    treat_as_collection = is_collection_url(url)
+    if is_channel_url(url):
+        kind = "channel"
+    elif is_playlist_url(url):
+        kind = "playlist"
+    else:
+        kind = "video"
+
+    # When the user wants the latest N items in YouTube's natural order, we
+    # can push the slice down into yt-dlp's extraction (only fetches what we
+    # need). For non-natural orders we have to extract the full collection
+    # and reorder client-side.
+    extraction_items = playlist_items
+    if (
+        treat_as_collection
+        and limit is not None
+        and order == "latest"
+        and not playlist_items
+    ):
+        extraction_items = f"1-{limit}"
 
     try:
-        playlist_title, entries = extract_entries(url, proxy, playlist_items)
+        collection_title, entries = extract_entries(url, proxy, extraction_items)
     except (DownloadError, RuntimeError) as e:
         console.print(f"[red]Failed to resolve URL:[/] {e}")
         return 1
@@ -783,9 +993,17 @@ def download(
         console.print("[red]No entries found at the given URL.[/]")
         return 1
 
-    if treat_as_playlist and playlist_title:
-        # Playlists download into their own subfolder.
-        output_dir = output_dir / _sanitize_filename(playlist_title)
+    # Reorder + limit (only meaningful for collections; ignored for single
+    # videos since len(entries) == 1).
+    if treat_as_collection and len(entries) > 1:
+        entries = _apply_order(entries, order)
+        if limit is not None and order != "latest":
+            # `extraction_items` already enforced the limit for `order=latest`.
+            entries = entries[:limit]
+
+    if treat_as_collection and collection_title:
+        # Channels and playlists download into their own subfolder.
+        output_dir = output_dir / _sanitize_filename(collection_title)
         output_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve the archive path now that we know the final output_dir. A
@@ -805,8 +1023,8 @@ def download(
 
     console.print(
         _format_header(
-            treat_as_playlist=treat_as_playlist,
-            playlist_title=playlist_title,
+            kind=kind,
+            collection_title=collection_title,
             n_items=len(entries),
             n_to_download=n_to_download,
             n_archived=n_archived,
@@ -816,6 +1034,8 @@ def download(
             rotate_cfg=rotate_cfg,
             archive_path=resolved_archive,
             playlist_items=playlist_items,
+            limit=limit,
+            order=order,
         )
     )
 
@@ -861,7 +1081,7 @@ def download(
                 entry=entry,
                 output_dir=output_dir,
                 proxy=proxy,
-                treat_as_playlist=treat_as_playlist,
+                treat_as_collection=treat_as_collection,
                 aggressive=aggressive,
                 rotate_cfg=rotate_cfg,
                 fp_iter=fp_iter,
@@ -899,7 +1119,7 @@ def _download_with_retry(
     entry: Entry,
     output_dir: Path,
     proxy: str | None,
-    treat_as_playlist: bool,
+    treat_as_collection: bool,
     aggressive: bool,
     rotate_cfg: RotateConfig,
     fp_iter: Iterable[dict[str, str]],
@@ -919,7 +1139,7 @@ def _download_with_retry(
                 entry=entry,
                 output_dir=output_dir,
                 proxy=proxy,
-                treat_as_playlist=treat_as_playlist,
+                treat_as_collection=treat_as_collection,
                 aggressive=aggressive,
                 fingerprint=fingerprint,
                 item_progress=item_progress,
@@ -964,6 +1184,45 @@ def _sanitize_filename(name: str) -> str:
     return _FILENAME_BAD_CHARS.sub("_", name).strip().rstrip(".")
 
 
+def _apply_order(entries: list[Entry], order: str) -> list[Entry]:
+    """Reorder entries per the requested `order` setting.
+
+    YouTube returns playlist / channel /videos entries in newest-first order,
+    so:
+        - 'latest'  → unchanged
+        - 'oldest'  → reverse (oldest upload first)
+        - 'popular' → sort by view_count descending; entries missing a view
+                      count are pushed to the end so they don't poison the
+                      top of the result set.
+    """
+    if order == "latest" or len(entries) <= 1:
+        return entries
+    if order == "oldest":
+        return list(reversed(entries))
+    if order == "popular":
+        n_with_views = sum(1 for e in entries if e.view_count is not None)
+        if n_with_views == 0:
+            console.print(
+                "[yellow]warning:[/] no view counts available for any entry; "
+                "'--order popular' falls back to YouTube's natural order."
+            )
+            return entries
+        if n_with_views < len(entries):
+            console.print(
+                f"[yellow]note:[/] {len(entries) - n_with_views} of "
+                f"{len(entries)} entries lack a view count and will be "
+                "ranked last under '--order popular'."
+            )
+        return sorted(
+            entries,
+            # Push missing-view-count entries to the end with -1; otherwise
+            # rank by view_count desc. Stable sort preserves natural order
+            # for ties (e.g. all entries within the same view bucket).
+            key=lambda e: (e.view_count is None, -(e.view_count or 0)),
+        )
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -978,14 +1237,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         prog="yt-mp3-downloader",
-        description="Download audio from a YouTube video or playlist as 320kbps MP3 (LAME).",
+        description=(
+            "Download audio from a YouTube video, playlist, or channel "
+            "as 320kbps MP3 (LAME)."
+        ),
     )
-    parser.add_argument("url", help="YouTube video or playlist URL.")
+    parser.add_argument(
+        "url",
+        metavar="TARGET",
+        help=(
+            "YouTube video URL, playlist URL, channel URL, or channel "
+            "handle. Accepts: a /watch?v=… URL; a /playlist?list=… URL; "
+            "a channel URL like /@handle, /@handle/videos, "
+            "/channel/UC…, /c/name, /user/name; or a bare handle like "
+            "'@handle', 'handle', or 'handle/videos' (auto-expanded to "
+            "https://www.youtube.com/@handle/videos)."
+        ),
+    )
     parser.add_argument(
         "-o", "--output",
         default=env_output,
         help=f"Output folder (default: ${ENV_OUTPUT} env var, or ./{DEFAULT_OUTPUT_DIR}). "
-             "Playlists create a subfolder named after the playlist title.",
+             "Playlists and channels create a subfolder named after the "
+             "playlist or channel title.",
     )
     parser.add_argument(
         "--proxy",
@@ -1004,8 +1278,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--playlist-items",
         default=None,
-        help="Restrict a playlist download to specific items, e.g. '1-3', "
-             "'1,5,8', or '1-3,7'. Same syntax as yt-dlp's --playlist-items.",
+        help="Restrict a playlist or channel download to specific items, e.g. "
+             "'1-3', '1,5,8', or '1-3,7'. Same syntax as yt-dlp's "
+             "--playlist-items. Mutually exclusive with --limit.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Download at most N items from a playlist or channel (after "
+             "ordering). Mutually exclusive with --playlist-items.",
+    )
+    parser.add_argument(
+        "--order",
+        choices=("latest", "oldest", "popular"),
+        default="latest",
+        help="Order in which playlist/channel items are picked: 'latest' "
+             "(default; newest first — YouTube's natural order), 'oldest' "
+             "(reverse — oldest uploads first), or 'popular' (most-viewed "
+             "first). For 'popular' on a channel, view counts are read from "
+             "the channel's video grid; entries with no view count are "
+             "ranked last.",
     )
     parser.add_argument(
         "--archive",
@@ -1075,6 +1369,17 @@ def main(argv: list[str] | None = None) -> int:
     ensure_ffmpeg()
     output_dir = Path(args.output).expanduser().resolve()
     proxy = args.proxy or None
+    target_url = normalize_input(args.url)
+
+    if args.limit is not None and args.playlist_items:
+        console.print(
+            "[red]Error:[/] --limit and --playlist-items are mutually "
+            "exclusive. Use one or the other."
+        )
+        return 2
+    if args.limit is not None and args.limit <= 0:
+        console.print("[red]Error:[/] --limit must be a positive integer.")
+        return 2
 
     rotate_cfg = RotateConfig(
         url=args.rotate_url or None,
@@ -1096,13 +1401,15 @@ def main(argv: list[str] | None = None) -> int:
         archive_path = Path(DEFAULT_ARCHIVE_FILENAME)
 
     return download(
-        url=args.url,
+        url=target_url,
         output_dir=output_dir,
         proxy=proxy,
         aggressive=args.aggressive,
         rotate_cfg=rotate_cfg,
         archive_path=archive_path,
         playlist_items=args.playlist_items,
+        limit=args.limit,
+        order=args.order,
     )
 
 

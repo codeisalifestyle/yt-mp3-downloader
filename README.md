@@ -1,30 +1,34 @@
 # yt-mp3-downloader
 
-A tiny CLI that downloads the audio of a public YouTube video or playlist and
-encodes it as **320 kbps MP3 (LAME)**. Renders a clean live progress UI and
-recovers from YouTube blocks by rotating proxy IPs and User-Agent fingerprints.
+A tiny CLI that downloads the audio of a public YouTube video, playlist, or
+channel and encodes it as **320 kbps MP3 (LAME)**. Renders a clean live
+progress UI and recovers from YouTube blocks by rotating proxy IPs and
+User-Agent fingerprints.
 
 > Use only with content you have the rights to download.
 
 ## Features
 
-- Single video **or** playlist input
+- Single video, playlist, **or** channel/account input — pass a URL or a bare handle
+- **Order & limit** — pick the N latest, oldest, or most-popular items from
+any playlist or channel
 - Output folder is configurable (default: `./downloads`)
-- Playlists are written into a subfolder named after the playlist title
+- Playlists and channels are written into a subfolder named after the
+playlist or channel title
 - 320 kbps MP3 via `libmp3lame`, with metadata tags
 - Optional HTTP / HTTPS proxy (SOCKS is **not** supported — see [Notes](#notes))
 - **Block-aware retry** — when YouTube returns a 403/429 or "sign in to confirm"
-  page, the downloader can call your proxy's IP-rotation endpoint and retry
-  with a new browser fingerprint
+page, the downloader can call your proxy's IP-rotation endpoint and retry
+with a new browser fingerprint
 - **Resume on rerun** — a per-output download archive remembers what's already
-  on disk so a partial run can be re-issued without re-downloading anything
+on disk so a partial run can be re-issued without re-downloading anything
 - Live progress UI (rich) with overall + per-track bars and a final summary table
 
 ## Requirements
 
 - Python 3.9+
-- [`ffmpeg`](https://ffmpeg.org/) on your `PATH` (this is what does the actual MP3 encoding via LAME)
-- [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and [`rich`](https://github.com/Textualize/rich) (installed from `requirements.txt`)
+- `[ffmpeg](https://ffmpeg.org/)` on your `PATH` (this is what does the actual MP3 encoding via LAME)
+- `[yt-dlp](https://github.com/yt-dlp/yt-dlp)` and `[rich](https://github.com/Textualize/rich)` (installed from `requirements.txt`)
 
 ### Install ffmpeg
 
@@ -72,10 +76,27 @@ python yt_mp3_downloader.py "https://www.youtube.com/watch?v=VIDEO_ID"
 # Playlist → <output>/<Playlist Title>/<Video Title>.mp3
 python yt_mp3_downloader.py "https://www.youtube.com/playlist?list=LIST_ID"
 
+# Channel / account by URL → <output>/<Channel Name>/<Video Title>.mp3
+python yt_mp3_downloader.py "https://www.youtube.com/@MrBeast"
+python yt_mp3_downloader.py "https://www.youtube.com/@MrBeast/videos"
+python yt_mp3_downloader.py "https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA"
+
+# Channel / account by bare handle (auto-expanded to /@<handle>/videos)
+python yt_mp3_downloader.py @MrBeast
+python yt_mp3_downloader.py MrBeast
+python yt_mp3_downloader.py MrBeast/videos
+
 # Custom output folder
 python yt_mp3_downloader.py URL -o ~/Music/yt
 
-# Restrict a playlist to specific items
+# Limit a playlist / channel run to N items (after ordering)
+python yt_mp3_downloader.py @MrBeast --limit 10
+
+# Pick the order: 'latest' (default), 'oldest', or 'popular'
+python yt_mp3_downloader.py @MrBeast --order popular --limit 10
+python yt_mp3_downloader.py @MrBeast --order oldest  --limit 5
+
+# Restrict a playlist or channel to specific items (mutually exclusive with --limit)
 python yt_mp3_downloader.py URL --playlist-items 1-3,7
 
 # Force a complete re-download (ignore the resume archive)
@@ -89,19 +110,81 @@ python yt_mp3_downloader.py URL --proxy http://user:pass@host:port
 python yt_mp3_downloader.py URL --aggressive
 ```
 
+### Picking how many items, and in what order
+
+Two flags control which items get downloaded from a playlist or channel.
+They apply to both, so any example using `@handle` works equally well with
+a `playlist?list=…` URL.
+
+- `--limit N` — download at most `N` items from the collection. Mutually
+exclusive with `--playlist-items`. When the order is `latest` (the
+default), the slice is pushed down into yt-dlp's extraction so only the
+N most-recent entries are fetched (fast). For `oldest` / `popular` the
+full grid is fetched once, then ranked client-side and trimmed to N.
+- `--order {latest,oldest,popular}` — ranking strategy.
+  - `latest` (default): YouTube's natural newest-first order.
+  - `oldest`: reversed (oldest uploads first).
+  - `popular`: ranked by view count, descending.
+
+For `--order popular`, view counts are read directly from the channel's
+video grid (the same numbers shown next to each thumbnail), so no
+per-video metadata fetch is required. If a few entries don't expose a
+view count (e.g. private or members-only items in a playlist), they're
+ranked last and the run continues.
+
+```bash
+# 5 newest uploads from a channel
+python yt_mp3_downloader.py @MrBeast --limit 5
+
+# 5 most-popular uploads from a channel (ranked over the whole channel)
+python yt_mp3_downloader.py @MrBeast --order popular --limit 5
+
+# 5 oldest uploads from a channel
+python yt_mp3_downloader.py @MrBeast --order oldest --limit 5
+
+# 10 most-popular videos from a playlist
+python yt_mp3_downloader.py "https://www.youtube.com/playlist?list=…" \
+    --order popular --limit 10
+```
+
+### Channel / account downloads
+
+Channels are downloaded into a subfolder named after the channel (the same
+way playlists are). Accepted input shapes:
+
+
+| Input                                     | Resolves to                                    |
+| ----------------------------------------- | ---------------------------------------------- |
+| `@MrBeast`                                | `https://www.youtube.com/@MrBeast/videos`      |
+| `MrBeast`                                 | `https://www.youtube.com/@MrBeast/videos`      |
+| `MrBeast/videos`                          | `https://www.youtube.com/@MrBeast/videos`      |
+| `https://www.youtube.com/@MrBeast`        | `https://www.youtube.com/@MrBeast/videos`      |
+| `https://www.youtube.com/@MrBeast/videos` | unchanged                                      |
+| `https://www.youtube.com/@MrBeast/shorts` | unchanged (downloads the Shorts tab as audio)  |
+| `https://www.youtube.com/channel/UC…`     | `https://www.youtube.com/channel/UC…/videos`   |
+| `https://www.youtube.com/c/<custom>`      | `https://www.youtube.com/c/<custom>/videos`    |
+| `https://www.youtube.com/user/<legacy>`   | `https://www.youtube.com/user/<legacy>/videos` |
+
+
+Bare channel root URLs and bare handles are auto-rewritten to the `/videos`
+tab so the run downloads regular uploads only (no shorts/streams). If you
+want a different tab, pass the full URL to that tab explicitly. You can use
+`--playlist-items` to restrict the run (e.g. `--playlist-items 1-10` for the
+10 most-recent uploads).
+
 ### Proxy-friendly defaults
 
 When `--proxy` (or `YTMP3_PROXY`) is set, the script automatically:
 
 - Drops `concurrent_fragment_downloads` from 4 → 1 to avoid swarming the
-  proxy with parallel TLS handshakes.
+proxy with parallel TLS handshakes.
 - Sets a 20 s `socket_timeout` so a stalled stream fails fast instead of
-  wedging the whole playlist.
+wedging the whole playlist.
 - Sleeps 2–6 s between playlist items so the proxy network can breathe.
 - Sends a mainstream desktop browser `User-Agent` so YouTube serves the
-  normal watch-page HTML instead of the mobile / consent redirect.
+normal watch-page HTML instead of the mobile / consent redirect.
 - Pre-flights the FalconProxy relay health endpoint when the proxy points
-  at `*.falconproxy.com` and prints a clear hint if it's down.
+at `*.falconproxy.com` and prints a clear hint if it's down.
 
 Use `--aggressive` to disable the safe profile when you're on a direct
 connection or a datacenter HTTP proxy.
@@ -123,10 +206,11 @@ python yt_mp3_downloader.py URL          # 20 ⏭ skip, 3 ✓ ok
 ```
 
 You can:
+
 - Point `--archive PATH` at any file (e.g. a single shared archive across
-  multiple playlists).
+multiple playlists).
 - Disable the archive entirely with `--no-archive` to force every item to
-  be re-downloaded.
+be re-downloaded.
 - Delete or edit the archive file to retry specific items.
 
 The archive uses the standard yt-dlp format, so it's interchangeable with
@@ -140,7 +224,7 @@ bot", "video unavailable", etc.), the downloader can:
 1. **POST** your proxy's IP-rotation endpoint to swap to a new exit IP.
 2. **Optionally poll** a status endpoint until the rotation completes.
 3. **Rotate the User-Agent fingerprint** (Chrome / Firefox / Safari mix) so
-   the retry doesn't carry the same signature as the blocked request.
+  the retry doesn't carry the same signature as the blocked request.
 4. **Retry** the failed item up to `--rotate-max-attempts` times.
 
 ```bash
@@ -176,14 +260,21 @@ Disable that with `--no-rotate-fingerprint`.
 
 ```
 positional arguments:
-  url                       YouTube video or playlist URL.
+  TARGET                    YouTube video URL, playlist URL, channel URL,
+                            or bare channel handle (e.g. '@handle').
 
 options:
   -o, --output OUTPUT       Output folder (default: ./downloads).
   --proxy PROXY             HTTP / HTTPS proxy URL. Pass "" to disable.
                             SOCKS proxies are not supported (see Notes).
-  --playlist-items SPEC     Restrict a playlist to specific items
-                            (e.g. '1-3', '1,5,8').
+  --playlist-items SPEC     Restrict a playlist or channel to specific
+                            items (e.g. '1-3', '1,5,8').
+  --limit N                 Download at most N items (applied after
+                            ordering). Mutually exclusive with
+                            --playlist-items.
+  --order {latest,oldest,popular}
+                            Order in which collection items are picked.
+                            Default: latest.
   --archive PATH            Path to the resume-on-rerun download archive
                             (default: <output>/.yt_mp3_archive.txt).
   --no-archive              Disable the archive (force full re-download).
@@ -198,25 +289,32 @@ block handling:
   --no-rotate-fingerprint   Pin one User-Agent for the whole run.
 ```
 
-## How playlist detection works
+## How playlist & channel detection works
 
-URLs containing a `list=` query parameter are treated as playlists, **except**
-auto-generated YouTube "Mix" / "Radio" lists (IDs starting with `RD`), which
-are effectively endless and are downloaded as a single video instead.
+- URLs containing a `list=` query parameter are treated as **playlists**,
+**except** auto-generated YouTube "Mix" / "Radio" lists (IDs starting
+with `RD`), which are effectively endless and are downloaded as a single
+video instead.
+- URLs matching `/@handle`, `/@handle/<tab>`, `/channel/UC…`, `/c/<name>`,
+or `/user/<name>` are treated as **channels**. Bare channel root URLs
+(no tab) are auto-rewritten to the `/videos` tab.
+- Anything that isn't an `http(s)://` URL is interpreted as a bare channel
+handle and expanded to `https://www.youtube.com/@<handle>/videos`.
 
 ## Notes
 
 - **SOCKS proxies are not supported.** yt-dlp's SOCKS transport relies on
-  PySocks, which monkey-patches `socket.socket` and is unreliable on
-  consecutive requests through some proxies — the first request typically
-  succeeds, then subsequent connections silently stall. The HTTP / HTTPS
-  path goes through `urllib3`'s proxy handler instead and works reliably.
-  If you only have a SOCKS endpoint available, terminate it locally with a
-  tool like `dante` or `srelay` and point the downloader at the local HTTP
-  proxy. The script rejects `socks*://` URLs with a clear error.
-- The MP3 quality is fixed at **320 kbps**, codec **`libmp3lame`** (hard-coded;
-  edit `MP3_BITRATE_KBPS` in `yt_mp3_downloader.py` if you ever want to change it).
+PySocks, which monkey-patches `socket.socket` and is unreliable on
+consecutive requests through some proxies — the first request typically
+succeeds, then subsequent connections silently stall. The HTTP / HTTPS
+path goes through `urllib3`'s proxy handler instead and works reliably.
+If you only have a SOCKS endpoint available, terminate it locally with a
+tool like `dante` or `srelay` and point the downloader at the local HTTP
+proxy. The script rejects `socks*://` URLs with a clear error.
+- The MP3 quality is fixed at **320 kbps**, codec `**libmp3lame`** (hard-coded;
+edit `MP3_BITRATE_KBPS` in `yt_mp3_downloader.py` if you ever want to change it).
 - Filenames are constrained to be Windows-safe so the output is portable.
 - Each playlist item is downloaded in its own yt-dlp invocation, so a single
-  unavailable video doesn't abort the rest of the playlist; the failed item
-  is reported in the final summary table.
+unavailable video doesn't abort the rest of the playlist; the failed item
+is reported in the final summary table.
+
