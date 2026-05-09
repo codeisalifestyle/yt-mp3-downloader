@@ -212,14 +212,6 @@ BLOCK_PATTERNS: list[re.Pattern] = [
     ]
 ]
 
-# Falconproxy staging/production health endpoints, keyed by the HTTP-proxy
-# port. We auto-detect by host and use these to give the user a clear error
-# before yt-dlp ever tries.
-FALCONPROXY_HEALTH_PORT_BY_PROXY_PORT = {
-    "8081": "9001",  # staging
-    "8080": "9000",  # production
-}
-
 console = Console()
 
 
@@ -413,30 +405,6 @@ def reject_unsupported_proxy(proxy: str) -> None:
         )
         console.print("       See the README for details.")
         sys.exit(1)
-
-
-def preflight_falconproxy(proxy: str) -> None:
-    """Best-effort health check of the falconproxy relay before downloading."""
-    parsed = urlparse(proxy)
-    if not parsed.hostname or "falconproxy" not in parsed.hostname:
-        return
-    port = str(parsed.port or "")
-    health_port = FALCONPROXY_HEALTH_PORT_BY_PROXY_PORT.get(port)
-    if not health_port:
-        return
-    health_url = f"http://{parsed.hostname}:{health_port}/health"
-    try:
-        with urllib.request.urlopen(health_url, timeout=5) as resp:
-            if resp.status != 200:
-                console.print(
-                    f"[yellow]preflight:[/] {health_url} returned HTTP {resp.status}"
-                )
-    except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
-        console.print(f"[yellow]preflight:[/] falconproxy health check failed ({health_url}): {e}")
-        console.print(
-            "[yellow]preflight:[/] The relay may be down or unreachable from this network. "
-            "yt-dlp will still try, but expect failures."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -642,21 +610,6 @@ def build_ydl_options(
         options["postprocessor_hooks"] = postprocessor_hooks
 
     return options
-
-
-def explain_download_error(err: DownloadError) -> str | None:
-    msg = str(err).lower()
-    if "exit relay" in msg and "inactive" in msg:
-        return (
-            "The proxy reports the device's exit relay is inactive. "
-            "Toggle it on from the device or the dashboard and retry."
-        )
-    if "tunnel" in msg and "not connected" in msg:
-        return (
-            "The proxy device tunnel is not connected. "
-            "Open the proxy app on the device to bring it back online."
-        )
-    return None
 
 
 @dataclass
@@ -960,7 +913,6 @@ def download(
 
     if proxy:
         reject_unsupported_proxy(proxy)
-        preflight_falconproxy(proxy)
 
     treat_as_collection = is_collection_url(url)
     if is_channel_url(url):
@@ -1159,8 +1111,7 @@ def _download_with_retry(
                 continue
             return ItemResult(entry=entry, success=False, error=last_error, attempts=attempts)
         except DownloadError as e:
-            hint = explain_download_error(e)
-            last_error = str(e)[:240] + (f" — {hint}" if hint else "")
+            last_error = str(e)[:240]
             console.print(f"  [red]✗ download error on[/] [dim]{entry.title[:60]}[/]: {last_error}")
             return ItemResult(entry=entry, success=False, error=last_error, attempts=attempts)
         except Exception as e:  # noqa: BLE001

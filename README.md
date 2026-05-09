@@ -183,8 +183,6 @@ wedging the whole playlist.
 - Sleeps 2–6 s between playlist items so the proxy network can breathe.
 - Sends a mainstream desktop browser `User-Agent` so YouTube serves the
 normal watch-page HTML instead of the mobile / consent redirect.
-- Pre-flights the FalconProxy relay health endpoint when the proxy points
-at `*.falconproxy.com` and prints a clear hint if it's down.
 
 Use `--aggressive` to disable the safe profile when you're on a direct
 connection or a datacenter HTTP proxy.
@@ -244,13 +242,17 @@ Or, equivalently, set `YTMP3_ROTATE_URL`, `YTMP3_ROTATE_AUTH`, and
 python yt_mp3_downloader.py URL
 ```
 
-The rotation URL is plug-pluggable — anything that accepts a `POST` and
-either returns a 2xx (with a fixed wait) or exposes a JSON status endpoint
-with a `rotating` boolean and `last_result` field will work. The defaults
-match the [FalconProxy](https://api.falconproxy.com) relay API:
+The rotation URL is plug-pluggable — any HTTP endpoint that accepts a
+`POST` and either:
 
-- Trigger: `POST /api/proxies/<proxy_endpoint_id>/rotate`
-- Status: `GET  /api/proxies/<proxy_endpoint_id>/rotation-status`
+- returns a 2xx response (after which the downloader waits `--rotate-wait`
+seconds before retrying), or
+- exposes a separate `--rotate-status-url` returning JSON with a
+`rotating` boolean and a `last_result` field of `success` / `completed`
+/ `ok` / `failed` / `error`,
+
+will work. Bring your own proxy provider — the downloader is just a
+client of whatever rotation API your proxy exposes.
 
 If your proxy doesn't expose a rotation API, you can omit `--rotate-url`;
 the downloader will still cycle User-Agent fingerprints across items.
